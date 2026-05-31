@@ -1,0 +1,19 @@
+[package]
+name = "fuzz-inprocess"
+version = "0.1.0"
+authors = ["sunjangyo12@gmail.com"]
+edition = "2018"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+frida-gum = {
+    version = "0.17.2",
+    features = [ "auto-download", "backtrace", "event-sink", "invocation-listener"]
+}
+lazy_static = "1.4"
+ctor = "0.2"
+libc = "0.2.126"

@@ -1,3 +1,6 @@
+//gcc -no-pie -o test test.c -Wstringop-overflow=0
+
+
 #include<sys/socket.h> 
 #include<netinet/in.h> 
 #include<stdio.h> 
@@ -13,6 +16,7 @@ void crash() {
     return;
 }
 
+//BC@
 void handleClient(char* buf) {
     if(buf[0]%5 == 1) {
         puts("--A--");
@@ -41,6 +45,8 @@ void handleClient(char* buf) {
 }
 
 int main(int argc, char** argv) {
+
+    printf("Target mainzz\n");
     char buf[100]; 
     socklen_t len; 
     int sock_desc,temp_sock_desc; 

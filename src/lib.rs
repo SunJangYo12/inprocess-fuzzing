@@ -8,11 +8,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, Duration};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
+use libc::{c_char, c_int, c_void};
+use std::cell::UnsafeCell;
+use std::sync::OnceLock;
+
+
+
 lazy_static! {
     static ref GUM: gum::Gum = unsafe { gum::Gum::obtain() };
 }
 
 const MAP_SIZE: usize = 65536;
+const TARGET_ADDR: usize = 0x000000000040131a;
 
 fn rdtsc() -> u64 {
     unsafe { std::arch::x86_64::_rdtsc() }
@@ -68,16 +75,41 @@ impl EventSink for SampleEventSink {
 }
 
 struct HookListener {
-    is_stalked: bool,
-    stalker: Stalker,
+    is_hit: Arc<Mutex<bool>>,
+    input: Vec<u8>,
 }
 
 impl InvocationListener for HookListener {
     fn on_enter(&mut self, _context: InvocationContext) {
-        println!("enter");
+
+        let mut hit = self.is_hit.lock().unwrap();
+
+        if *hit {
+            *hit = false;
+            let cpu = _context.cpu_context();
+            println!("[+] Target HIT {:#x}", cpu.rip());
+
+            let mut rng = Rng::new();
+
+            type HarnessFn = extern "C" fn(*const u8);
+            let harness: HarnessFn = unsafe {
+                std::mem::transmute(TARGET_ADDR as *const ())
+            };
+
+            print!("[+] Start fuzzing...\n");
+            loop {
+
+                harness(self.input.as_ptr());
+
+                for _ in 0..rng.rand() % 16 {
+                   let sel = rng.rand() % &self.input.len();
+                   self.input[sel] = rng.rand() as u8;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
     fn on_leave(&mut self, _context: InvocationContext) {
-        println!("leave");
     }
 }
 
@@ -86,18 +118,6 @@ struct Corpus {
     coverage_bitmap: Vec<AtomicU8>,
     prev_loc: AtomicU64,
 }
-/*
-impl Corpus {
-    fn get_corpus(self) {
-        let mut edges = 0;
-        for x in self.coverage_bitmap {
-            if x.load(Ordering::Relaxed) != 0 {
-                edges += 1;
-            }
-        }
-        print!("edges: {}\n", edges);
-    }
-}*/
 
 fn worker_stalker(corpus: Arc<Corpus>, tid: usize) {
     let mut stalker = Stalker::new(&GUM);
@@ -138,13 +158,6 @@ fn worker_stalker(corpus: Arc<Corpus>, tid: usize) {
     } else {
         stalker.follow(tid, &transformer, Some(&mut event_sink));
     }
-/*
-    type ParserFn = unsafe extern "C" fn(
-            *mut Context,
-            *const u8,
-            usize,
-    );
-    let parser: ParserFn = unsafe { std::mem::transmute(parser_addr) };*/
 }
 
 fn worker_monitor(corpus: Arc<Corpus>) {
@@ -199,7 +212,7 @@ fn init() {
     std::thread::spawn(move|| {
         worker_stalker(corpus1, process.id() as usize);
 
-        println!(" - Stalker thread ID: {} | Attach ID: {}", process.current_thread_id(), process.id());
+        println!("[+] Stalker thread ID: {} | Attach ID: {}", process.current_thread_id(), process.id());
     });
 
     // monitor worker
@@ -208,39 +221,25 @@ fn init() {
         worker_monitor(corpus2);
     });
 
-    let addr: usize = 0x000000000040131a;
     //let mut fuzz = Fuzzer::new(addr);
     //fuzz.setup_stalker(0);
     //fuzz.setup_hook();
 
-    let mut input: Vec<u8> = vec![0x41, 0x41, 0x41, 0x41];
-    let mut rng = Rng::new();
+    let is_hit = Arc::new(Mutex::new(true));
 
-    type HarnessFn = extern "C" fn(*const u8);
-    let harness: HarnessFn = unsafe {
-        std::mem::transmute(addr as *const ())
-    };
-    loop {
-
-        harness(input.as_ptr());
-
-        for _ in 0..rng.rand() % 16 {
-           let sel = rng.rand() % &input.len();
-           input[sel] = rng.rand() as u8;
+    let listener = Box::leak(Box::new(
+        HookListener {
+            is_hit: Arc::clone(&is_hit),
+            input: vec![0x41, 0x41, 0x41, 0x41],
         }
-        std::thread::sleep(Duration::from_millis(1000));
-    }
-
-
-/*    let mut interceptor = Box::leak(Box::new(Interceptor::obtain(&GUM)));
+    ));
+            
+    let mut interceptor = Box::leak(Box::new(Interceptor::obtain(&GUM)));
     interceptor.attach(
-        NativePointer(addr as *mut _),
-        Box::leak(Box::new(
-            HookListener {
-                is_stalked: true,
-                stalker: Stalker::new(&GUM),
-            }
-        )),
-    );*/
+        NativePointer(TARGET_ADDR as *mut _),
+        listener,
+    );
+
+    //if *is_hit.lock().unwrap()
 }
 

@@ -74,18 +74,23 @@ impl EventSink for SampleEventSink {
     }
 }
 
+struct Stats {
+    fcps: AtomicU64,
+}
+
 struct HookListener {
     is_hit: Arc<Mutex<bool>>,
+    stats: Arc<Stats>,
     input: Vec<u8>,
 }
 
 impl InvocationListener for HookListener {
     fn on_enter(&mut self, _context: InvocationContext) {
-
         let mut hit = self.is_hit.lock().unwrap();
 
         if *hit {
             *hit = false;
+
             let cpu = _context.cpu_context();
             println!("[+] Target HIT {:#x}", cpu.rip());
 
@@ -97,6 +102,7 @@ impl InvocationListener for HookListener {
             };
 
             print!("[+] Start fuzzing...\n");
+
             loop {
 
                 harness(self.input.as_ptr());
@@ -105,6 +111,8 @@ impl InvocationListener for HookListener {
                    let sel = rng.rand() % &self.input.len();
                    self.input[sel] = rng.rand() as u8;
                 }
+
+                self.stats.fcps.fetch_add(1, Ordering::Relaxed);
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
@@ -160,10 +168,11 @@ fn worker_stalker(corpus: Arc<Corpus>, tid: usize) {
     }
 }
 
-fn worker_monitor(corpus: Arc<Corpus>) {
+fn worker_monitor(corpus: Arc<Corpus>, stats: Arc<Stats>) {
     let start = Instant::now();
     loop {
         let elapsed = start.elapsed().as_secs_f64();
+        let fcps = stats.fcps.load(Ordering::Relaxed);
 
         let mut edges = 0;
         for x in &corpus.coverage_bitmap {
@@ -174,7 +183,7 @@ fn worker_monitor(corpus: Arc<Corpus>) {
 
         let density = (edges as f64 / MAP_SIZE as f64) * 100.0;
 
-        print!("[{:10.4}] paths: {} | density {:.2}% | \n", elapsed, edges, density);
+        print!("[{:10.4}] fcps {} | paths: {} | density {:.2}% | \n", elapsed, fcps, edges, density);
         std::thread::sleep(Duration::from_millis(1000));
     }
 }
@@ -215,21 +224,15 @@ fn init() {
         println!("[+] Stalker thread ID: {} | Attach ID: {}", process.current_thread_id(), process.id());
     });
 
-    // monitor worker
-    let corpus2 = corpus.clone();
-    std::thread::spawn(move|| {
-        worker_monitor(corpus2);
-    });
-
-    //let mut fuzz = Fuzzer::new(addr);
-    //fuzz.setup_stalker(0);
-    //fuzz.setup_hook();
-
     let is_hit = Arc::new(Mutex::new(true));
+    let stats = Arc::new(Stats {
+        fcps: AtomicU64::new(0),
+    });
 
     let listener = Box::leak(Box::new(
         HookListener {
             is_hit: Arc::clone(&is_hit),
+            stats: Arc::clone(&stats),
             input: vec![0x41, 0x41, 0x41, 0x41],
         }
     ));
@@ -239,7 +242,14 @@ fn init() {
         NativePointer(TARGET_ADDR as *mut _),
         listener,
     );
-
     //if *is_hit.lock().unwrap()
-}
 
+
+    // monitor worker
+    let corpus2 = corpus.clone();
+    let stats2 = Arc::clone(&stats);
+    std::thread::spawn(move|| {
+        worker_monitor(corpus2, stats2);
+    });
+
+}

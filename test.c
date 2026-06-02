@@ -24,7 +24,6 @@ void handleClient(char* buf) {
             puts("--AB--");
             if(buf[2]%7 == 1) {
                 puts("--ABC--");
-            crash();
                 if(buf[3]%8 == 1) {
                     puts("--ABCD--");
                     if(buf[4]%9 == 1) {

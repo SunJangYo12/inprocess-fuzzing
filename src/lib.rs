@@ -113,7 +113,6 @@ impl InvocationListener for HookListener {
                         self.fuzz_input.extend_from_slice(input);
                     }
                 }
-
                 // The worlds best mutator
                 if self.fuzz_input.len() > 0 {
                     for _ in 0..rng.rand() % 16 {

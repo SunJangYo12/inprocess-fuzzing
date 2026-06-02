@@ -17,3 +17,7 @@ frida-gum = {
 lazy_static = "1.4"
 ctor = "0.2"
 libc = "0.2.126"
+
+falkhash = { path = "shared/falkhash" }
+atomicvec = { path = "shared/atomicvec" }
+aht = { path = "shared/aht" }

@@ -1,18 +1,16 @@
 use frida_gum as gum;
 use frida_gum::stalker::{Event, EventMask, EventSink, Stalker, Transformer};
 use frida_gum::interceptor::{Interceptor, InvocationContext, InvocationListener};
-use frida_gum::{Module, NativePointer};
+use frida_gum::{Module, NativePointer, MemoryRange};
 use lazy_static::lazy_static;
 use ctor::ctor;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, Duration};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use libc::{c_char, c_int, c_void};
-use std::cell::UnsafeCell;
-use std::sync::OnceLock;
-
-
+use atomicvec::AtomicVec;
+use aht::Aht;
+use falkhash::FalkHasher;
 
 lazy_static! {
     static ref GUM: gum::Gum = unsafe { gum::Gum::obtain() };
@@ -43,32 +41,21 @@ impl Rng {
     }
 }
 
-struct SampleEventSink {
-    blocks: Arc<Mutex<Vec<u64>>>,
-}
+struct SampleEventSink;
 
 impl EventSink for SampleEventSink {
     fn query_mask(&mut self) -> EventMask {
         EventMask::None
     }
-
     fn start(&mut self) {
         println!("start");
     }
-
     fn process(&mut self, _event: &Event) {
-        match _event {
-            Event::Block { start, end } => {
-                println!("process: {:x?}", start);
-            }
-            _=> {}
-        }
+        println!("process");
     }
-
     fn flush(&mut self) {
         println!("flush");
     }
-
     fn stop(&mut self) {
         println!("stop");
     }
@@ -81,7 +68,11 @@ struct Stats {
 struct HookListener {
     is_hit: Arc<Mutex<bool>>,
     stats: Arc<Stats>,
-    input: Vec<u8>,
+
+    inputs: AtomicVec<Vec<u8>, 1048576>,
+    input_hashes: Aht<u128, (), 1048576>,
+    hasher: FalkHasher,
+    fuzz_input: Vec<u8>,
 }
 
 impl InvocationListener for HookListener {
@@ -92,28 +83,52 @@ impl InvocationListener for HookListener {
             *hit = false;
 
             let cpu = _context.cpu_context();
-            println!("[+] Target HIT {:#x}", cpu.rip());
-
             let mut rng = Rng::new();
 
+            println!("[+] Target HIT {:#x}", cpu.rip());
             type HarnessFn = extern "C" fn(*const u8);
             let harness: HarnessFn = unsafe {
                 std::mem::transmute(TARGET_ADDR as *const ())
             };
 
+            for filename in std::fs::read_dir("inputs").unwrap() {
+                let filename = filename.unwrap().path();
+                let data = std::fs::read(filename).unwrap();
+                let hash = self.hasher.myhash(&data);
+
+                // Save the input and log it in the hash table
+                self.input_hashes.entry_or_insert(&hash, hash as usize, || {
+                    self.inputs.push(Box::new(data));
+                    Box::new(())
+                });
+            }
+
             print!("[+] Start fuzzing...\n");
 
             loop {
-
-                harness(self.input.as_ptr());
-
-                for _ in 0..rng.rand() % 16 {
-                   let sel = rng.rand() % &self.input.len();
-                   self.input[sel] = rng.rand() as u8;
+                // Pick a random file from the corpus as an input
+                if self.inputs.len() > 0 {
+                    let sel = rng.rand() % self.inputs.len();
+                    if let Some(input) = self.inputs.get(sel) {
+                        self.fuzz_input.extend_from_slice(input);
+                    }
                 }
 
+                // The worlds best mutator
+                if self.fuzz_input.len() > 0 {
+                    for _ in 0..rng.rand() % 16 {
+                        let sel = rng.rand() % self.fuzz_input.len();
+                        self.fuzz_input[sel] = rng.rand() as u8;
+                    }
+                }
+
+                harness(self.fuzz_input.as_ptr());
+
                 self.stats.fcps.fetch_add(1, Ordering::Relaxed);
-                std::thread::sleep(Duration::from_millis(100));
+                self.fuzz_input.clear();
+
+                //debug
+                //std::thread::sleep(Duration::from_millis(500));
             }
         }
     }
@@ -127,8 +142,12 @@ struct Corpus {
     prev_loc: AtomicU64,
 }
 
-fn worker_stalker(corpus: Arc<Corpus>, tid: usize) {
+fn worker_stalker(corpus: Arc<Corpus>, tid: usize, ex_range: Vec<MemoryRange>) {
     let mut stalker = Stalker::new(&GUM);
+
+    for range in &ex_range {
+        stalker.exclude(range);
+    }
 
     let transformer = Transformer::from_callback(&GUM, move |basic_block, _output| {
         let mut begin = true;
@@ -155,9 +174,7 @@ fn worker_stalker(corpus: Arc<Corpus>, tid: usize) {
         }
     });
 
-    let blocks_collected: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let mut event_sink = SampleEventSink {
-        blocks: Arc::clone(&blocks_collected),
     };
 
     if tid == 0 {
@@ -190,6 +207,9 @@ fn worker_monitor(corpus: Arc<Corpus>, stats: Arc<Stats>) {
 
 #[ctor]
 fn init() {
+    std::fs::create_dir_all("inputs").expect("Folder inputs gagal dibuat");
+    std::fs::create_dir_all("crashes").expect("Folder crashes gagal dibuat");
+
     let process = frida_gum::Process::obtain(&GUM);
     println!("Process Information");
     println!("-------------------");
@@ -199,15 +219,19 @@ fn init() {
     println!(" - Main module: {:x?}", process.main_module());
     println!(" - Current thread ID: {}", process.current_thread_id());
     println!(" - Enumerate modules:");
-    let ranges = process.enumerate_modules();
-    for module in ranges {
+
+    let stalker_whitelist = ["test"];
+    let mut excluded_modules = Vec::new();
+
+    let all_modules = process.enumerate_modules();
+    for module in all_modules {
         println!("   - {:?}", module);
+
+        let name = module.name();
+        if !stalker_whitelist.contains(&name.as_str()) {
+            excluded_modules.push(module.range());
+        }
     }
-
-    //let module = process.find_module_by_name("test").unwrap();
-    //let module_base = module.range().base_address();
-    //let off_target = module_base + 0xxx;
-
     println!("\n");
 
 
@@ -219,11 +243,12 @@ fn init() {
     // stalker worker
     let corpus1 = corpus.clone();
     std::thread::spawn(move|| {
-        worker_stalker(corpus1, process.id() as usize);
+        worker_stalker(corpus1, process.id() as usize, excluded_modules);
 
         println!("[+] Stalker thread ID: {} | Attach ID: {}", process.current_thread_id(), process.id());
     });
 
+    // fuzzer worker
     let is_hit = Arc::new(Mutex::new(true));
     let stats = Arc::new(Stats {
         fcps: AtomicU64::new(0),
@@ -233,16 +258,19 @@ fn init() {
         HookListener {
             is_hit: Arc::clone(&is_hit),
             stats: Arc::clone(&stats),
-            input: vec![0x41, 0x41, 0x41, 0x41],
+
+            inputs: AtomicVec::new(),
+            input_hashes: Aht::new(),
+            hasher: FalkHasher::new(),
+            fuzz_input: Vec::new(),
         }
     ));
             
-    let mut interceptor = Box::leak(Box::new(Interceptor::obtain(&GUM)));
+    let interceptor = Box::leak(Box::new(Interceptor::obtain(&GUM)));
     interceptor.attach(
         NativePointer(TARGET_ADDR as *mut _),
         listener,
-    );
-    //if *is_hit.lock().unwrap()
+    ).unwrap();
 
 
     // monitor worker

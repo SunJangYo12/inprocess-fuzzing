@@ -7,6 +7,9 @@ use ctor::ctor;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, Duration};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::fs::File;
+use std::io::Write;
+use std::collections::HashSet;
 
 use atomicvec::AtomicVec;
 use aht::Aht;
@@ -127,7 +130,7 @@ impl InvocationListener for HookListener {
                 self.fuzz_input.clear();
 
                 //debug
-                //std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(Duration::from_millis(500));
             }
         }
     }
@@ -139,6 +142,13 @@ impl InvocationListener for HookListener {
 struct Corpus {
     coverage_bitmap: Vec<AtomicU8>,
     prev_loc: AtomicU64,
+
+    /// overwrite data
+    last_block: AtomicU64,
+    coverage_log: Mutex<File>,
+
+    /// no duplicate write coverage.txt
+    seen_blocks: Mutex<HashSet<u64>>,
 }
 
 fn worker_stalker(corpus: Arc<Corpus>, tid: usize, ex_range: Vec<MemoryRange>) {
@@ -161,6 +171,8 @@ fn worker_stalker(corpus: Arc<Corpus>, tid: usize, ex_range: Vec<MemoryRange>) {
                 let corpus2 = corpus.clone();
 
                 instr.put_callout(move |_cpu_context| {
+                    corpus2.last_block.store(insn.address() as u64, Ordering::Relaxed);
+
                     let prev = corpus2.prev_loc.load(Ordering::Relaxed);
                     let idx  = ((prev ^ cur_loc) as usize) & (MAP_SIZE - 1);
 
@@ -199,7 +211,16 @@ fn worker_monitor(corpus: Arc<Corpus>, stats: Arc<Stats>) {
 
         let density = (edges as f64 / MAP_SIZE as f64) * 100.0;
 
-        print!("[{:10.4}] fcps {} | paths: {} | density {:.2}% | \n", elapsed, fcps, edges, density);
+        print!("[{:10.4}] fcps {:5.0} | paths: {} | density {:.2}% | \n", elapsed, fcps as f64 / elapsed, edges, density);
+
+        let last = corpus.last_block.load(Ordering::Relaxed);
+        let mut seen = corpus.seen_blocks.lock().unwrap();
+
+        if seen.insert(last) {
+            let mut cl = corpus.coverage_log.lock().unwrap();
+            write!(cl, "{:x}\n", last).unwrap();
+        }
+
         std::thread::sleep(Duration::from_millis(1000));
     }
 }
@@ -237,6 +258,10 @@ fn init() {
     let corpus = Arc::new(Corpus {
         coverage_bitmap: (0..MAP_SIZE).map(|_| AtomicU8::new(0)).collect(),
         prev_loc: 0.into(),
+        last_block: 0.into(),
+        coverage_log: Mutex::new(File::create("coverage.txt")
+            .expect("Failed to create coverage file")),
+        seen_blocks: Mutex::new(HashSet::new()),
     });
 
     // stalker worker

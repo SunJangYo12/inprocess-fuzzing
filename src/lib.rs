@@ -69,6 +69,7 @@ impl EventSink for SampleEventSink {
 
 struct Stats {
     fcps: AtomicU64,
+    edge: AtomicU64,
     unique: AtomicU64,
 }
 
@@ -78,20 +79,36 @@ struct HookListener {
     corpus: Arc<Corpus>,
 
     fuzz_input: Vec<u8>,
+
+    trace_bit: Box<[u8; MAP_SIZE]>,
+    virgin_bit: Box<[u8; MAP_SIZE]>,
+    prev_loc: u64,
 }
 
 impl InvocationListener for HookListener {
     fn on_enter(&mut self, _context: InvocationContext) {
         let mut hit = self.is_hit.lock().unwrap();
 
+        // ======= statistic ===========
+        /*self.stats.edge.store(0, Ordering::Relaxed);
+        for &x in self.trace_bit.iter() {
+            if x != 0 {
+                self.stats.edge.fetch_add(1, Ordering::Relaxed);
+            }
+        }*/
+
+
         if *hit {
             *hit = false;
 
             // stalker worker
             let corpus1 = self.corpus.clone();
-            std::thread::spawn(move|| {
-                worker_stalker(corpus1);
-            });
+            // dipakai jika tanpa filter range karena oprasi call_out berat
+            //std::thread::spawn(move|| {
+                let tracebit_ptr = self.trace_bit.as_mut_ptr();
+                let prevloc_ptr  = &mut self.prev_loc as *mut u64;
+                worker_stalker(corpus1, tracebit_ptr, prevloc_ptr);
+            //});
 
             let cpu = _context.cpu_context();
             let mut rng = Rng::new();
@@ -102,7 +119,7 @@ impl InvocationListener for HookListener {
                 std::mem::transmute(TARGET_ADDR as *const ())
             };
 
-            print!("[+] Start fuzzing... {}\n", self.corpus.inputs.len());
+            print!("[+] Start fuzzing...\n");
 
             loop {
                 // Pick a random file from the corpus as an input
@@ -120,15 +137,27 @@ impl InvocationListener for HookListener {
                     }
                 }
                 // reset bitmap
-                //self.corpus.prev_loc.store(0, Ordering::Relaxed);
+                //unsafe { std::ptr::write_bytes(tracebit_ptr, 0, MAP_SIZE); }
+                self.prev_loc = 0;
+                self.trace_bit.fill(0);
+
+                for &x in self.trace_bit.iter() {
+                    if x != 0 {
+                        print!("zzzz: {}\n", x);
+                    }
+                }
 
                 harness(self.fuzz_input.as_ptr());
+
+/*                if self.corpus.has_new_coverage(&tracebit_ptr) {
+                    print!("new cov\n");
+                }*/
 
                 self.stats.fcps.fetch_add(1, Ordering::Relaxed);
                 self.fuzz_input.clear();
 
                 //debug
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(Duration::from_millis(5500));
             }
         }
     }
@@ -138,13 +167,6 @@ impl InvocationListener for HookListener {
 
 
 struct Corpus {
-    /// hanya saat harness dieksekusi, lalu direset
-    coverage_bitmap: Box<[u8; MAP_SIZE]>,
-    prev_loc: u64,
-
-    /// coverage sebenarnya
-    virgin_bitmap: Vec<AtomicU8>,
-
     /// overwrite data for file log
     last_block: AtomicU64,
     tid_parent: u32,
@@ -158,15 +180,25 @@ struct Corpus {
     inputs: AtomicVec<Vec<u8>, 1048576>,
     hasher: FalkHasher,
 }
+impl Corpus {
+    fn has_new_coverage(self, coverage: &[u8]) -> bool {
+        let mut found = false;
+        for i in 0..coverage.len() {
+        }
+        found
+    }
+}
 
-fn worker_stalker(corpus: Arc<Corpus>) {
+
+fn worker_stalker(corpus: Arc<Corpus>, tracebit_ptr: *mut u8, prevloc_ptr: *mut u64) {
     let mut stalker = Stalker::new(&GUM);
 
-    /*
+    stalker.set_trust_threshold(0);
+
     for range in &corpus.coverage_range {
         print!("[+] Stalking blacklist {}\n", range);
         stalker.exclude(range);
-    }*/
+    }
 
     let tid = corpus.tid_parent as usize;
 
@@ -177,38 +209,20 @@ fn worker_stalker(corpus: Arc<Corpus>) {
             let insn = instr.instr();
 
             if begin {
-                /* example:
-                    0x401230 >> 4    = 0x40123
-                    0x40123 & 0xffff = 0x0123 -> ini jadi id block
-                */
                 let cur_loc = ((insn.address() as u64 >> 4) & 0xffff) as u64;
-
                 //print!("stalk {:x}\n", insn.address());
-                let corpus2 = corpus.clone();
-
-
-
-                let bitmap_ptr = corpus.coverage_bitmap.as_ptr() as *mut u8;
-                let prev_loc_ptr = &corpus.prev_loc as *const u64 as *mut u64;
-
-                instr.put_callout(move |_cpu_context| {
-                    corpus2.last_block.store(insn.address() as u64, Ordering::Relaxed);
-
-                    let mut prev = unsafe { *prev_loc_ptr };
-
-                    // example: 0x100 ^ 0x200 = 0x300
-                    // cov 0x100 -> 0x200 dipetakan ke bitmap[0x300]
-                    let idx  = ((prev ^ cur_loc) as usize) & (MAP_SIZE - 1);
-
-                    // bitmap[0x300] = 0 -> 1
-                    // jika edge sama dilewati lagi alias bitmap[0x300] = 2 dst
+                //let corpus2 = corpus.clone();
+                
+                instr.put_callout(move|_cpu_context| {
+                    //corpus2.last_block.store(insn.address() as u64, Ordering::Relaxed);
                     unsafe {
-                        let p = bitmap_ptr.add(idx);
+                        let prev = *prevloc_ptr;
+                        let idx = ((prev ^ cur_loc) as usize) & (MAP_SIZE - 1);
+
+                        let p = tracebit_ptr.add(idx);
                         *p = (*p).wrapping_add(1);
 
-                        // example: cur_loc = 0x200 maka prev_loc = 0x100
-                        // tujuan pakai ini supaya A->B tidak sama B->A
-                        prev = cur_loc >> 1;
+                        *prevloc_ptr = cur_loc >> 1;
                     }
                 });
                 begin = false;
@@ -234,15 +248,7 @@ fn worker_monitor(corpus: Arc<Corpus>, stats: Arc<Stats>) {
         let elapsed = start.elapsed().as_secs_f64();
         let fcps = stats.fcps.load(Ordering::Relaxed) as f64 / elapsed;
         let unique = stats.unique.load(Ordering::Relaxed);
-
-        let mut edges = 0;
-        for &x in corpus.coverage_bitmap.iter() {
-            // Jika nilai bukan lagi 0xFF, berarti setidaknya ada 1 bucket/jalur
-            // yang sudah ditemukan oleh fuzzer di index in.
-            if x != 0 {
-                edges += 1;
-            }
-        }
+        let edges = stats.edge.load(Ordering::Relaxed);
 
         let density = (edges as f64 / MAP_SIZE as f64) * 100.0;
 
@@ -293,10 +299,6 @@ fn init() {
 
 
     let corpus = Arc::new(Corpus {
-        //coverage_bitmap: (0..MAP_SIZE).map(|_| AtomicU8::new(0)).collect(),
-        coverage_bitmap: Box::new([0; MAP_SIZE]),
-        virgin_bitmap:   (0..MAP_SIZE).map(|_| AtomicU8::new(0xFF)).collect(),
-        prev_loc:        0u64,
         last_block:      0.into(),
         tid_parent:      process.id(),
         coverage_log:    Mutex::new(File::create("coverage.txt").expect("Failed to create coverage file")),
@@ -326,6 +328,7 @@ fn init() {
     let stats = Arc::new(Stats {
         fcps:   AtomicU64::new(0),
         unique: AtomicU64::new(0),
+        edge: AtomicU64::new(0),
     });
 
     let corpus_fuzz = corpus.clone();
@@ -336,6 +339,10 @@ fn init() {
             corpus: Arc::clone(&corpus_fuzz),
 
             fuzz_input:   Vec::new(),
+
+            trace_bit:       Box::new([0; MAP_SIZE]),
+            virgin_bit:      Box::new([0xFF; MAP_SIZE]),
+            prev_loc:       0u64,
         }
     ));
             

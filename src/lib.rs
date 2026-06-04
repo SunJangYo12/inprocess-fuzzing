@@ -1,4 +1,4 @@
-//pub mod instrument;
+mod bitmap;
 
 use frida_gum as gum;
 use frida_gum::stalker::{Event, EventMask, EventSink, Stalker, Transformer};
@@ -16,13 +16,13 @@ use std::collections::HashSet;
 use atomicvec::AtomicVec;
 use aht::Aht;
 use falkhash::FalkHasher;
-//use instrument::Instrument;
+use bitmap::Bitmap;
 
 lazy_static! {
     static ref GUM: gum::Gum = unsafe { gum::Gum::obtain() };
 }
 
-const MAP_SIZE: usize = 65536;
+pub const MAP_SIZE: usize = 65536;
 const TARGET_ADDR: usize = 0x000000000040131a;
 
 fn rdtsc() -> u64 {
@@ -79,24 +79,12 @@ struct HookListener {
     corpus: Arc<Corpus>,
 
     fuzz_input: Vec<u8>,
-
-    trace_bit: Box<[u8; MAP_SIZE]>,
-    virgin_bit: Box<[u8; MAP_SIZE]>,
-    prev_loc: u64,
+    bitmap: Box<Bitmap>,
 }
 
 impl InvocationListener for HookListener {
     fn on_enter(&mut self, _context: InvocationContext) {
         let mut hit = self.is_hit.lock().unwrap();
-
-        // ======= statistic ===========
-        /*self.stats.edge.store(0, Ordering::Relaxed);
-        for &x in self.trace_bit.iter() {
-            if x != 0 {
-                self.stats.edge.fetch_add(1, Ordering::Relaxed);
-            }
-        }*/
-
 
         if *hit {
             *hit = false;
@@ -105,9 +93,9 @@ impl InvocationListener for HookListener {
             let corpus1 = self.corpus.clone();
             // dipakai jika tanpa filter range karena oprasi call_out berat
             //std::thread::spawn(move|| {
-                let tracebit_ptr = self.trace_bit.as_mut_ptr();
-                let prevloc_ptr  = &mut self.prev_loc as *mut u64;
-                worker_stalker(corpus1, tracebit_ptr, prevloc_ptr);
+                let bitmap_ptr: *mut Bitmap = self.bitmap.as_mut() as *mut Bitmap;
+
+                worker_stalker(corpus1, bitmap_ptr);
             //});
 
             let cpu = _context.cpu_context();
@@ -137,11 +125,12 @@ impl InvocationListener for HookListener {
                     }
                 }
                 // reset bitmap
-                //unsafe { std::ptr::write_bytes(tracebit_ptr, 0, MAP_SIZE); }
-                self.prev_loc = 0;
-                self.trace_bit.fill(0);
+                //self.prev_loc = 0;
+                //self.trace_bit.fill(0);
+                self.bitmap.clear();
 
-                for &x in self.trace_bit.iter() {
+                // cek reset failed, alias filter lib mendeteksi sejenis memset
+                for &x in self.bitmap.trace_bits.iter() {
                     if x != 0 {
                         print!("zzzz: {}\n", x);
                     }
@@ -149,15 +138,11 @@ impl InvocationListener for HookListener {
 
                 harness(self.fuzz_input.as_ptr());
 
-/*                if self.corpus.has_new_coverage(&tracebit_ptr) {
-                    print!("new cov\n");
-                }*/
-
                 self.stats.fcps.fetch_add(1, Ordering::Relaxed);
                 self.fuzz_input.clear();
 
                 //debug
-                std::thread::sleep(Duration::from_millis(5500));
+                std::thread::sleep(Duration::from_millis(2500));
             }
         }
     }
@@ -165,13 +150,11 @@ impl InvocationListener for HookListener {
     }
 }
 
-
 struct Corpus {
     /// overwrite data for file log
     last_block: AtomicU64,
     tid_parent: u32,
     coverage_log: Mutex<File>,
-    coverage_range: Vec<MemoryRange>,
 
     /// no duplicate write coverage.txt
     seen_blocks: Mutex<HashSet<u64>>,
@@ -180,27 +163,29 @@ struct Corpus {
     inputs: AtomicVec<Vec<u8>, 1048576>,
     hasher: FalkHasher,
 }
-impl Corpus {
-    fn has_new_coverage(self, coverage: &[u8]) -> bool {
-        let mut found = false;
-        for i in 0..coverage.len() {
-        }
-        found
-    }
-}
 
-
-fn worker_stalker(corpus: Arc<Corpus>, tracebit_ptr: *mut u8, prevloc_ptr: *mut u64) {
+fn worker_stalker(corpus: Arc<Corpus>, bitmap_ptr: *mut Bitmap) {
     let mut stalker = Stalker::new(&GUM);
+    let process = frida_gum::Process::obtain(&GUM);
 
-    stalker.set_trust_threshold(0);
-
-    for range in &corpus.coverage_range {
-        print!("[+] Stalking blacklist {}\n", range);
-        stalker.exclude(range);
+    let stalker_whitelist = ["test"];
+    for module in process.enumerate_modules() {
+        let name = module.name();
+        if stalker_whitelist.contains(&name.as_str()) {
+            println!("   - Oke: {:?}", module);
+        } else {
+            println!("   - Exclude: {:?}", module);
+            stalker.exclude(&module.range()); //not work
+        }
     }
 
-    let tid = corpus.tid_parent as usize;
+
+    let target = process.enumerate_modules().into_iter().find(|m| m.name() == "test").unwrap();
+
+    let start = target.range().base_address().0 as u64;
+    let end = start + target.range().size() as u64;
+
+    print!("[+] Stalking range = {:#x} - {:#x}\n", start, end);
 
     let transformer = Transformer::from_callback(&GUM, move |basic_block, _output| {
         let mut begin = true;
@@ -210,21 +195,27 @@ fn worker_stalker(corpus: Arc<Corpus>, tracebit_ptr: *mut u8, prevloc_ptr: *mut 
 
             if begin {
                 let cur_loc = ((insn.address() as u64 >> 4) & 0xffff) as u64;
-                //print!("stalk {:x}\n", insn.address());
-                //let corpus2 = corpus.clone();
-                
-                instr.put_callout(move|_cpu_context| {
-                    //corpus2.last_block.store(insn.address() as u64, Ordering::Relaxed);
-                    unsafe {
-                        let prev = *prevloc_ptr;
-                        let idx = ((prev ^ cur_loc) as usize) & (MAP_SIZE - 1);
 
-                        let p = tracebit_ptr.add(idx);
-                        *p = (*p).wrapping_add(1);
+                //if insn.address() >= start && insn.address() < end {
+                if true {
+                    //print!("stalk {:x}\n", insn.address());
 
-                        *prevloc_ptr = cur_loc >> 1;
-                    }
-                });
+                    //let corpus2 = corpus.clone();
+                    
+                    let bm = bitmap_ptr;
+                    instr.put_callout(move|_cpu_context| {
+                        //corpus2.last_block.store(insn.address() as u64, Ordering::Relaxed);
+                        unsafe {
+                            //(*bm).hit(cur_loc);
+                            let prev = (*bm).prev_loc;
+                            let idx = ((prev ^ cur_loc) as usize) & (MAP_SIZE - 1);
+
+                            (*bm).trace_bits[idx] = (*bm).trace_bits[idx].wrapping_add(1);
+
+                            (*bm).prev_loc = cur_loc >> 1;
+                        }
+                    });
+                }
                 begin = false;
             }
             instr.keep();
@@ -234,6 +225,8 @@ fn worker_stalker(corpus: Arc<Corpus>, tracebit_ptr: *mut u8, prevloc_ptr: *mut 
     let mut event_sink = SampleEventSink {
     };
 
+    stalker.set_trust_threshold(0);
+    let tid = corpus.tid_parent as usize;
     if tid == 0 {
         stalker.follow_me(&transformer, Some(&mut event_sink));
         //stalker.unfollow_me();
@@ -281,20 +274,6 @@ fn init() {
     println!(" - Code signing policy: {:?}", process.code_signing_policy());
     println!(" - Main module: {:x?}", process.main_module());
     println!(" - Current thread ID: {}", process.current_thread_id());
-    println!(" - Enumerate modules:");
-
-    let stalker_whitelist = ["test"];
-    let mut stalker_range = Vec::new();
-
-    let all_modules = process.enumerate_modules();
-    for module in all_modules {
-        println!("   - {:?}", module);
-
-        let name = module.name();
-        if !stalker_whitelist.contains(&name.as_str()) {
-            stalker_range.push(module.range());
-        }
-    }
     println!("\n");
 
 
@@ -303,7 +282,6 @@ fn init() {
         tid_parent:      process.id(),
         coverage_log:    Mutex::new(File::create("coverage.txt").expect("Failed to create coverage file")),
         seen_blocks:     Mutex::new(HashSet::new()),
-        coverage_range:  stalker_range,
         input_hashes: Aht::new(),
         inputs:       AtomicVec::new(),
         hasher:       FalkHasher::new(),
@@ -339,10 +317,7 @@ fn init() {
             corpus: Arc::clone(&corpus_fuzz),
 
             fuzz_input:   Vec::new(),
-
-            trace_bit:       Box::new([0; MAP_SIZE]),
-            virgin_bit:      Box::new([0xFF; MAP_SIZE]),
-            prev_loc:       0u64,
+            bitmap: Box::new(Bitmap::new()),
         }
     ));
             

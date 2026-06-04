@@ -14,7 +14,41 @@ impl Bitmap {
         }
     }
 
+
     #[inline(always)]
+    pub fn has_new_bits(&mut self) -> i32 {
+        let mut ret = 0;
+        unsafe {
+            let current = self.trace_bits.as_ptr() as *const u32;
+            let virgin = self.virgin_bits.as_mut_ptr() as *mut u32;
+
+            for i in 0..(MAP_SIZE / 4) {
+                let cur_word = *current.add(i);
+                let vir_word = *virgin.add(i);
+
+                if cur_word != 0 && (cur_word & vir_word) != 0 {
+                    if ret < 2 {
+                        let cur = self.trace_bits.as_ptr().add(i * 4);
+                        let vir = self.virgin_bits.as_ptr().add(i * 4);
+
+                        if (*cur.add(0) != 0 && *vir.add(0) == 0xff)
+                            || (*cur.add(1) != 0 && *vir.add(1) == 0xff)
+                            || (*cur.add(2) != 0 && *vir.add(2) == 0xff)
+                            || (*cur.add(3) != 0 && *vir.add(3) == 0xff)
+                        {
+                            ret = 2;
+                        } else {
+                            ret = 1;
+                        }
+                    }
+                    *virgin.add(i) &= !cur_word;
+                }
+            }
+        }
+        ret
+    }
+
+    #[inline(always)] //inline compiler copy code ini ke pemanggil
     pub fn clear(&mut self) {
         self.trace_bits.fill(0);
         self.prev_loc = 0;

@@ -89,12 +89,12 @@ impl InvocationListener for HookListener {
         if *hit {
             *hit = false;
 
+            let bitmap_ptr: *mut Bitmap = self.bitmap.as_mut() as *mut Bitmap;
+
             // stalker worker
             let corpus1 = self.corpus.clone();
             // dipakai jika tanpa filter range karena oprasi call_out berat
             //std::thread::spawn(move|| {
-                let bitmap_ptr: *mut Bitmap = self.bitmap.as_mut() as *mut Bitmap;
-
                 worker_stalker(corpus1, bitmap_ptr);
             //});
 
@@ -125,24 +125,27 @@ impl InvocationListener for HookListener {
                     }
                 }
                 // reset bitmap
-                //self.prev_loc = 0;
-                //self.trace_bit.fill(0);
+                //unsafe { (*bitmap_ptr).clear(); }
                 self.bitmap.clear();
 
-                // cek reset failed, alias filter lib mendeteksi sejenis memset
-                /*for &x in self.bitmap.trace_bits.iter() {
-                    if x != 0 {
-                        print!("zzzz: {}\n", x);
-                    }
-                }*/
-
                 harness(self.fuzz_input.as_ptr());
+
+
+                match self.bitmap.has_new_bits() {
+                    2 => {
+                        print!("new path\n");
+                    }
+                    1 => {
+                        print!("new hit count\n");
+                    }
+                    _ => {}
+                }
 
                 self.stats.fcps.fetch_add(1, Ordering::Relaxed);
                 self.fuzz_input.clear();
 
                 //debug
-                std::thread::sleep(Duration::from_millis(2500));
+                std::thread::sleep(Duration::from_millis(500));
             }
         }
     }
@@ -179,8 +182,6 @@ fn worker_stalker(corpus: Arc<Corpus>, bitmap_ptr: *mut Bitmap) {
             stalker.exclude(&module.range()); //not work
         }
     }*/
-
-
     let target = process.enumerate_modules().into_iter().find(|m| m.name() == "test").unwrap();
 
     let start = target.range().base_address().0 as u64;

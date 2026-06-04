@@ -130,11 +130,11 @@ impl InvocationListener for HookListener {
                 self.bitmap.clear();
 
                 // cek reset failed, alias filter lib mendeteksi sejenis memset
-                for &x in self.bitmap.trace_bits.iter() {
+                /*for &x in self.bitmap.trace_bits.iter() {
                     if x != 0 {
                         print!("zzzz: {}\n", x);
                     }
-                }
+                }*/
 
                 harness(self.fuzz_input.as_ptr());
 
@@ -168,6 +168,7 @@ fn worker_stalker(corpus: Arc<Corpus>, bitmap_ptr: *mut Bitmap) {
     let mut stalker = Stalker::new(&GUM);
     let process = frida_gum::Process::obtain(&GUM);
 
+    /*
     let stalker_whitelist = ["test"];
     for module in process.enumerate_modules() {
         let name = module.name();
@@ -177,7 +178,7 @@ fn worker_stalker(corpus: Arc<Corpus>, bitmap_ptr: *mut Bitmap) {
             println!("   - Exclude: {:?}", module);
             stalker.exclude(&module.range()); //not work
         }
-    }
+    }*/
 
 
     let target = process.enumerate_modules().into_iter().find(|m| m.name() == "test").unwrap();
@@ -196,8 +197,7 @@ fn worker_stalker(corpus: Arc<Corpus>, bitmap_ptr: *mut Bitmap) {
             if begin {
                 let cur_loc = ((insn.address() as u64 >> 4) & 0xffff) as u64;
 
-                //if insn.address() >= start && insn.address() < end {
-                if true {
+                if insn.address() >= start && insn.address() < end {
                     //print!("stalk {:x}\n", insn.address());
 
                     //let corpus2 = corpus.clone();

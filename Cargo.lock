@@ -298,6 +298,7 @@ dependencies = [
  "frida-gum",
  "lazy_static",
  "libc",
+ "rand",
 ]
 
 [[package]]

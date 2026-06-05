@@ -21,3 +21,5 @@ libc = "0.2.126"
 falkhash = { path = "shared/falkhash" }
 atomicvec = { path = "shared/atomicvec" }
 aht = { path = "shared/aht" }
+
+rand = "0.9"

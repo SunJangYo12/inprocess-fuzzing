@@ -1,4 +1,5 @@
 mod bitmap;
+mod mutator;
 
 use frida_gum as gum;
 use frida_gum::stalker::{Event, EventMask, EventSink, Stalker, Transformer};
@@ -13,10 +14,13 @@ use std::fs::File;
 use std::io::Write;
 use std::collections::HashSet;
 
+use rand::Rng;
+
 use atomicvec::AtomicVec;
 use aht::Aht;
 use falkhash::FalkHasher;
 use bitmap::Bitmap;
+use mutator::HavocMutator;
 
 lazy_static! {
     static ref GUM: gum::Gum = unsafe { gum::Gum::obtain() };
@@ -24,28 +28,6 @@ lazy_static! {
 
 pub const MAP_SIZE: usize = 65536;
 const TARGET_ADDR: usize = 0x000000000040131a;
-
-fn rdtsc() -> u64 {
-    unsafe { std::arch::x86_64::_rdtsc() }
-}
-
-struct Rng(u64);
-impl Rng {
-    /// Create a new random number generator
-    fn new() -> Self {
-        Rng(0x342c4d6241337665 ^ rdtsc())
-    }
-
-    // Generate a random number
-    #[inline]
-    fn rand(&mut self) -> usize {
-        let val = self.0;
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 17;
-        self.0 ^= self.0 << 43;
-        val as usize
-    }
-}
 
 struct SampleEventSink;
 
@@ -101,13 +83,9 @@ impl InvocationListener for HookListener {
 
             // stalker worker
             let corpus1 = self.corpus.clone();
-            // dipakai jika tanpa filter range karena oprasi call_out berat
-            //std::thread::spawn(move|| {
-                worker_stalker(corpus1, bitmap_ptr);
-            //});
+            worker_stalker(corpus1, bitmap_ptr);
 
             let cpu = _context.cpu_context();
-            let mut rng = Rng::new();
 
             println!("[+] Target HIT {:#x}", cpu.rip());
             type HarnessFn = extern "C" fn(*const u8);
@@ -133,8 +111,6 @@ impl InvocationListener for HookListener {
                 match self.bitmap.has_new_bits() {
                     2 => {
                         self.stats.edge.fetch_add(1, Ordering::Relaxed);
-
-
                         self.corpus.input_hashes.entry_or_insert(&input_hash, input_hash as usize, || {
                             self.corpus.inputs.push(Box::new(self.fuzz_input.clone()));
                             self.stats.queue.fetch_add(1, Ordering::Relaxed);
@@ -144,8 +120,6 @@ impl InvocationListener for HookListener {
                     1 => {
                         print!("new hit count\n");
                         self.stats.edge_state.fetch_add(1, Ordering::Relaxed);
-
-
                         self.corpus.input_hashes.entry_or_insert(&input_hash, input_hash as usize, || {
                             self.corpus.inputs.push(Box::new(self.fuzz_input.clone()));
                             self.stats.queue.fetch_add(1, Ordering::Relaxed);
@@ -158,32 +132,30 @@ impl InvocationListener for HookListener {
                 self.fuzz_input.clear();
             }
 
+            let havoc = HavocMutator::new();
+            let mut rng = rand::rng();
+
             print!("[+] Start fuzzing...\n");
             loop {
-                //debug cat all input
-                /*for i in 0..self.corpus.inputs.len() {
-                    if let Some(input) = self.corpus.inputs.get(i) {
-                        print!("zzzzzzzzzzz: {}", String::from_utf8_lossy(input));
-                    }
-                }
-                print!("\n");*/
-
                 // Pick a random file from the corpus as an input
                 if self.corpus.inputs.len() > 0 {
-                    let sel = rng.rand() % self.corpus.inputs.len();
+                    //let sel = rng.rand() % self.corpus.inputs.len();
+                    let sel = rand::random_range(0..=self.corpus.inputs.len());
                     if let Some(input) = self.corpus.inputs.get(sel) {
                         self.fuzz_input.extend_from_slice(input);
                     }
                 }
                 // The worlds best mutator
-                if self.fuzz_input.len() > 0 {
+                /*if self.fuzz_input.len() > 0 {
                     for _ in 0..rng.rand() % 16 {
                         let sel = rng.rand() % self.fuzz_input.len();
                         self.fuzz_input[sel] = rng.rand() as u8;
                     }
-                }
+                }*/
+
+                havoc.mutate(&mut rng, &mut self.fuzz_input);
+
                 // reset bitmap
-                //unsafe { (*bitmap_ptr).clear(); }
                 self.bitmap.clear();
 
                 harness(self.fuzz_input.as_ptr());

@@ -68,9 +68,17 @@ impl EventSink for SampleEventSink {
 }
 
 struct Stats {
+    /// fuzzcases per second
     fcps: AtomicU64,
+
+    /// new edge path
     edge: AtomicU64,
-    unique: AtomicU64,
+
+    /// edge for hit count like detect loop or state
+    edge_state: AtomicU64,
+
+    /// unique input or hit new edge
+    queue: AtomicU64,
 }
 
 struct HookListener {
@@ -107,9 +115,59 @@ impl InvocationListener for HookListener {
                 std::mem::transmute(TARGET_ADDR as *const ())
             };
 
-            print!("[+] Start fuzzing...\n");
+            // dry input
+            for filename in std::fs::read_dir("inputs").unwrap() {
+                let filename = filename.unwrap().path();
+                let data = std::fs::read(&filename).unwrap();
 
+                print!("[+] Dry inputs {}\n", filename.display());
+
+                self.bitmap.clear();
+
+                self.fuzz_input.extend_from_slice(&data);
+                harness(self.fuzz_input.as_ptr());
+
+                self.bitmap.classify_counts();
+                let input_hash = self.corpus.hasher.myhash(&self.fuzz_input);
+
+                match self.bitmap.has_new_bits() {
+                    2 => {
+                        self.stats.edge.fetch_add(1, Ordering::Relaxed);
+
+
+                        self.corpus.input_hashes.entry_or_insert(&input_hash, input_hash as usize, || {
+                            self.corpus.inputs.push(Box::new(self.fuzz_input.clone()));
+                            self.stats.queue.fetch_add(1, Ordering::Relaxed);
+                            Box::new(())
+                        });
+                    }
+                    1 => {
+                        print!("new hit count\n");
+                        self.stats.edge_state.fetch_add(1, Ordering::Relaxed);
+
+
+                        self.corpus.input_hashes.entry_or_insert(&input_hash, input_hash as usize, || {
+                            self.corpus.inputs.push(Box::new(self.fuzz_input.clone()));
+                            self.stats.queue.fetch_add(1, Ordering::Relaxed);
+                            Box::new(())
+                        });
+                    }
+                    _ => {}
+                }
+                self.stats.fcps.fetch_add(1, Ordering::Relaxed);
+                self.fuzz_input.clear();
+            }
+
+            print!("[+] Start fuzzing...\n");
             loop {
+                //debug cat all input
+                /*for i in 0..self.corpus.inputs.len() {
+                    if let Some(input) = self.corpus.inputs.get(i) {
+                        print!("zzzzzzzzzzz: {}", String::from_utf8_lossy(input));
+                    }
+                }
+                print!("\n");*/
+
                 // Pick a random file from the corpus as an input
                 if self.corpus.inputs.len() > 0 {
                     let sel = rng.rand() % self.corpus.inputs.len();
@@ -130,13 +188,38 @@ impl InvocationListener for HookListener {
 
                 harness(self.fuzz_input.as_ptr());
 
+                self.bitmap.classify_counts();
 
                 match self.bitmap.has_new_bits() {
                     2 => {
-                        print!("new path\n");
+                        //print!("new path: {:#x}\n", self.bitmap.last_pc);
+                        self.stats.edge.fetch_add(1, Ordering::Relaxed);
+
+                        let input_hash = self.corpus.hasher.myhash(&self.fuzz_input);
+                        let input_clone = self.fuzz_input.clone();
+
+                        // Save the input and log it in the hash table
+                        self.corpus.input_hashes.entry_or_insert(&input_hash, input_hash as usize, || {
+                            let input_save = input_clone;
+
+                            let newinput = std::path::Path::new("queue").join(
+                                format!("edge({}):{:#x}:{:x?}",
+                                    self.stats.edge.load(Ordering::Relaxed),
+                                    self.bitmap.last_pc,
+                                    input_hash
+                                )
+                            );
+                            let _ = std::fs::write(newinput, &input_save);
+
+                            self.corpus.inputs.push(Box::new(input_save));
+                            self.stats.queue.fetch_add(1, Ordering::Relaxed);
+                            Box::new(())
+                        });
                     }
                     1 => {
-                        print!("new hit count\n");
+                        print!("new hit count: {:#x}\n", self.bitmap.last_pc);
+                        self.stats.edge_state.fetch_add(1, Ordering::Relaxed);
+
                     }
                     _ => {}
                 }
@@ -145,7 +228,7 @@ impl InvocationListener for HookListener {
                 self.fuzz_input.clear();
 
                 //debug
-                std::thread::sleep(Duration::from_millis(500));
+                //std::thread::sleep(Duration::from_millis(500));
             }
         }
     }
@@ -155,7 +238,6 @@ impl InvocationListener for HookListener {
 
 struct Corpus {
     /// overwrite data for file log
-    last_block: AtomicU64,
     tid_parent: u32,
     coverage_log: Mutex<File>,
 
@@ -200,12 +282,11 @@ fn worker_stalker(corpus: Arc<Corpus>, bitmap_ptr: *mut Bitmap) {
 
                 if insn.address() >= start && insn.address() < end {
                     //print!("stalk {:x}\n", insn.address());
-
-                    //let corpus2 = corpus.clone();
                     
                     let bm = bitmap_ptr;
+                    unsafe { (*bm).last_pc = insn.address(); }
+
                     instr.put_callout(move|_cpu_context| {
-                        //corpus2.last_block.store(insn.address() as u64, Ordering::Relaxed);
                         unsafe {
                             //(*bm).hit(cur_loc);
                             let prev = (*bm).prev_loc;
@@ -241,22 +322,24 @@ fn worker_monitor(corpus: Arc<Corpus>, stats: Arc<Stats>) {
     loop {
         let elapsed = start.elapsed().as_secs_f64();
         let fcps = stats.fcps.load(Ordering::Relaxed) as f64 / elapsed;
-        let unique = stats.unique.load(Ordering::Relaxed);
+        let queue = stats.queue.load(Ordering::Relaxed);
         let edges = stats.edge.load(Ordering::Relaxed);
+        let edge_state = stats.edge_state.load(Ordering::Relaxed);
 
         let density = (edges as f64 / MAP_SIZE as f64) * 100.0;
 
-        print!("[{:10.4}] fcps {:5.0} | path: {} | density {:.2}% | unique {}\n",
-            elapsed, fcps, edges, density, unique
+        print!("[{:10.4}] fcps {:5.0} | path: {}/{} | density {:.2}% | queue {}\n",
+            elapsed, fcps, edges, edge_state, density, queue
         );
 
-        let last = corpus.last_block.load(Ordering::Relaxed);
+        let last = 0;
         let mut seen = corpus.seen_blocks.lock().unwrap();
 
+        /*
         if seen.insert(last) {
             let mut cl = corpus.coverage_log.lock().unwrap();
-            write!(cl, "{:x},{},{:5.0},{}\n", last, edges, fcps, unique).unwrap();
-        }
+            write!(cl, "{:x},{},{:5.0},{}\n", last, edges, fcps, queue).unwrap();
+        }*/
 
         std::thread::sleep(Duration::from_millis(1000));
     }
@@ -265,6 +348,7 @@ fn worker_monitor(corpus: Arc<Corpus>, stats: Arc<Stats>) {
 #[ctor]
 fn init() {
     std::fs::create_dir_all("inputs").expect("Folder inputs gagal dibuat");
+    std::fs::create_dir_all("queue").expect("Folder inputs gagal dibuat");
     std::fs::create_dir_all("crashes").expect("Folder crashes gagal dibuat");
 
     let process = frida_gum::Process::obtain(&GUM);
@@ -277,9 +361,14 @@ fn init() {
     println!(" - Current thread ID: {}", process.current_thread_id());
     println!("\n");
 
+    let stats = Arc::new(Stats {
+        fcps:   AtomicU64::new(0),
+        queue: AtomicU64::new(0),
+        edge: AtomicU64::new(0),
+        edge_state: AtomicU64::new(0),
+    });
 
     let corpus = Arc::new(Corpus {
-        last_block:      0.into(),
         tid_parent:      process.id(),
         coverage_log:    Mutex::new(File::create("coverage.txt").expect("Failed to create coverage file")),
         seen_blocks:     Mutex::new(HashSet::new()),
@@ -297,20 +386,15 @@ fn init() {
         // Save the input and log it in the hash table
         corpus.input_hashes.entry_or_insert(&hash, hash as usize, || {
             corpus.inputs.push(Box::new(data));
+            stats.queue.fetch_add(1, Ordering::Relaxed);
             Box::new(())
         });
     }
 
 
     // fuzzer worker
-    let is_hit = Arc::new(Mutex::new(true));
-    let stats = Arc::new(Stats {
-        fcps:   AtomicU64::new(0),
-        unique: AtomicU64::new(0),
-        edge: AtomicU64::new(0),
-    });
-
     let corpus_fuzz = corpus.clone();
+    let is_hit = Arc::new(Mutex::new(true));
     let listener = Box::leak(Box::new(
         HookListener {
             is_hit: Arc::clone(&is_hit),

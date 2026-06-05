@@ -4,7 +4,7 @@ mod mutator;
 use frida_gum as gum;
 use frida_gum::stalker::{Event, EventMask, EventSink, Stalker, Transformer};
 use frida_gum::interceptor::{Interceptor, InvocationContext, InvocationListener};
-use frida_gum::{Module, NativePointer, MemoryRange};
+use frida_gum::NativePointer;
 use lazy_static::lazy_static;
 use ctor::ctor;
 use std::sync::{Arc, Mutex};
@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::fs::File;
 use std::io::Write;
 use std::collections::HashSet;
-
 use rand::Rng;
+use std::io::{BufRead, BufReader};
+use std::net::{TcpListener, TcpStream};
 
 use atomicvec::AtomicVec;
 use aht::Aht;
@@ -27,7 +28,6 @@ lazy_static! {
 }
 
 pub const MAP_SIZE: usize = 65536;
-const TARGET_ADDR: usize = 0x000000000040131a;
 
 struct SampleEventSink;
 
@@ -90,7 +90,7 @@ impl InvocationListener for HookListener {
             println!("[+] Target HIT {:#x}", cpu.rip());
             type HarnessFn = extern "C" fn(*const u8);
             let harness: HarnessFn = unsafe {
-                std::mem::transmute(TARGET_ADDR as *const ())
+                std::mem::transmute(self.corpus.target.load(Ordering::Relaxed) as *const ())
             };
 
             // dry input
@@ -145,13 +145,6 @@ impl InvocationListener for HookListener {
                         self.fuzz_input.extend_from_slice(input);
                     }
                 }
-                // The worlds best mutator
-                /*if self.fuzz_input.len() > 0 {
-                    for _ in 0..rng.rand() % 16 {
-                        let sel = rng.rand() % self.fuzz_input.len();
-                        self.fuzz_input[sel] = rng.rand() as u8;
-                    }
-                }*/
 
                 havoc.mutate(&mut rng, &mut self.fuzz_input);
 
@@ -170,7 +163,6 @@ impl InvocationListener for HookListener {
                         let input_hash = self.corpus.hasher.myhash(&self.fuzz_input);
                         let input_clone = self.fuzz_input.clone();
 
-                        // Save the input and log it in the hash table
                         self.corpus.input_hashes.entry_or_insert(&input_hash, input_hash as usize, || {
                             let input_save = input_clone;
 
@@ -210,6 +202,7 @@ impl InvocationListener for HookListener {
 
 struct Corpus {
     /// overwrite data for file log
+    target: AtomicU64,
     tid_parent: u32,
     coverage_log: Mutex<File>,
 
@@ -241,7 +234,8 @@ fn worker_stalker(corpus: Arc<Corpus>, bitmap_ptr: *mut Bitmap) {
     let start = target.range().base_address().0 as u64;
     let end = start + target.range().size() as u64;
 
-    print!("[+] Stalking range = {:#x} - {:#x}\n", start, end);
+    print!("[+] Stalking [{:#X}] range = {:#x} - {:#x}\n",
+        corpus.target.load(Ordering::Relaxed), start, end);
 
     let transformer = Transformer::from_callback(&GUM, move |basic_block, _output| {
         let mut begin = true;
@@ -289,40 +283,114 @@ fn worker_stalker(corpus: Arc<Corpus>, bitmap_ptr: *mut Bitmap) {
     }
 }
 
-fn worker_monitor(corpus: Arc<Corpus>, stats: Arc<Stats>) {
-    let start = Instant::now();
+fn handle_client(mut stream: TcpStream, corpus: Arc<Corpus>, stats: Arc<Stats>) {
+    let reader_stream = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(reader_stream);
+
+    writeln!(stream, "\n").unwrap();
+    writeln!(stream, "  Welcome to FUZZER PROXY").unwrap();
+    writeln!(stream, "              v3.2.1\n").unwrap();
+
     loop {
-        let elapsed = start.elapsed().as_secs_f64();
-        let fcps = stats.fcps.load(Ordering::Relaxed) as f64 / elapsed;
-        let queue = stats.queue.load(Ordering::Relaxed);
-        let edges = stats.edge.load(Ordering::Relaxed);
-        let edge_state = stats.edge_state.load(Ordering::Relaxed);
+        write!(stream, "> ").unwrap();
+        stream.flush().unwrap();
 
-        let density = (edges as f64 / MAP_SIZE as f64) * 100.0;
+        let mut line = String::new();
 
-        print!("[{:10.4}] fcps {:5.0} | path: {}/{} | density {:.2}% | queue {}\n",
-            elapsed, fcps, edges, edge_state, density, queue
-        );
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // client disconnect
+            Ok(_) => {
+                let cmd = line.trim();
 
-        let last = 0;
-        let mut seen = corpus.seen_blocks.lock().unwrap();
+                if cmd == "help" {
+                    writeln!(stream, "1. target: hook target address").unwrap();
+                    writeln!(stream, "2. tracebuf: tracing all function for potential input buffer by user").unwrap();
+                    writeln!(stream, "3. stats: show information for fuzzer proces live no promt").unwrap();
+                    writeln!(stream, "4. stat: show 10 cases information for fuzzer proces, back to prompt").unwrap();
+                    writeln!(stream, "5. help: show help").unwrap();
+                }
+                else if cmd == "target" {
+                    write!(stream, "Example 0x000000000040131a\n").unwrap();
+                    write!(stream, "target> ").unwrap();
 
-        /*
-        if seen.insert(last) {
-            let mut cl = corpus.coverage_log.lock().unwrap();
-            write!(cl, "{:x},{},{:5.0},{}\n", last, edges, fcps, queue).unwrap();
-        }*/
+                    let mut addr = String::new();
+                    reader.read_line(&mut addr);
 
-        std::thread::sleep(Duration::from_millis(1000));
+                    // fuzzer worker
+                    //let corpus_fuzz = corpus.clone();
+                    let is_hit = Arc::new(Mutex::new(true));
+                    let listener = Box::leak(Box::new(
+                        HookListener {
+                            is_hit: Arc::clone(&is_hit),
+                            stats:  Arc::clone(&stats),
+                            corpus: Arc::clone(&corpus),
+
+                            fuzz_input:   Vec::new(),
+                            bitmap: Box::new(Bitmap::new()),
+                        }
+                    ));
+
+                    let addr = u64::from_str_radix(addr.trim().trim_start_matches("0x"), 16).expect("gagal string to usize");
+
+                    corpus.target.store(addr, Ordering::Relaxed);
+
+                    let interceptor = Box::leak(Box::new(Interceptor::obtain(&GUM)));
+                    interceptor.attach(
+                        NativePointer(addr as *mut _),
+                        listener,
+                    ).unwrap();
+                    write!(stream, "[+] Attaching: {:#x}\n", addr).unwrap();
+                }
+                else if cmd == "stat" {
+                    let start = Instant::now();
+                    for zz in 0..10 {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let fcps = stats.fcps.load(Ordering::Relaxed) as f64 / elapsed;
+                        let queue = stats.queue.load(Ordering::Relaxed);
+                        let edges = stats.edge.load(Ordering::Relaxed);
+                        let edge_state = stats.edge_state.load(Ordering::Relaxed);
+
+                        let density = (edges as f64 / MAP_SIZE as f64) * 100.0;
+
+                        write!(stream, "[{:10.4}] fcps {:5.0} | path: {}/{} |\
+                                        density {:.2}% | queue {}\n",
+                            elapsed, fcps, edges, edge_state, density, queue
+                        ).unwrap();
+                    }
+                }
+                else if cmd == "stats" {
+                    let start = Instant::now();
+                    loop {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let fcps = stats.fcps.load(Ordering::Relaxed) as f64 / elapsed;
+                        let queue = stats.queue.load(Ordering::Relaxed);
+                        let edges = stats.edge.load(Ordering::Relaxed);
+                        let edge_state = stats.edge_state.load(Ordering::Relaxed);
+
+                        let density = (edges as f64 / MAP_SIZE as f64) * 100.0;
+
+                        write!(stream, "[{:10.4}] fcps {:5.0} | path: {}/{} |\
+                                        density {:.2}% | queue {}\n",
+                            elapsed, fcps, edges, edge_state, density, queue
+                        ).unwrap();
+                        std::thread::sleep(Duration::from_millis(1000));
+                    }
+                }
+                else if cmd == "exit" {
+                    writeln!(stream, "bye").unwrap();
+                    break;
+                }
+                else {
+                    writeln!(stream, "\n'{}' command not found\n", cmd).unwrap();
+                }
+            }
+            Err(_) => break,
+        }
     }
 }
 
 #[ctor]
 fn init() {
-    std::fs::create_dir_all("inputs").expect("Folder inputs gagal dibuat");
-    std::fs::create_dir_all("queue").expect("Folder inputs gagal dibuat");
-    std::fs::create_dir_all("crashes").expect("Folder crashes gagal dibuat");
-
     let process = frida_gum::Process::obtain(&GUM);
     println!("Process Information");
     println!("-------------------");
@@ -333,6 +401,10 @@ fn init() {
     println!(" - Current thread ID: {}", process.current_thread_id());
     println!("\n");
 
+    std::fs::create_dir_all("inputs").expect("Folder inputs gagal dibuat");
+    std::fs::create_dir_all("queue").expect("Folder inputs gagal dibuat");
+    std::fs::create_dir_all("crashes").expect("Folder crashes gagal dibuat");
+
     let stats = Arc::new(Stats {
         fcps:   AtomicU64::new(0),
         queue: AtomicU64::new(0),
@@ -341,6 +413,7 @@ fn init() {
     });
 
     let corpus = Arc::new(Corpus {
+        target:          AtomicU64::new(0),
         tid_parent:      process.id(),
         coverage_log:    Mutex::new(File::create("coverage.txt").expect("Failed to create coverage file")),
         seen_blocks:     Mutex::new(HashSet::new()),
@@ -363,32 +436,25 @@ fn init() {
         });
     }
 
-
-    // fuzzer worker
-    let corpus_fuzz = corpus.clone();
-    let is_hit = Arc::new(Mutex::new(true));
-    let listener = Box::leak(Box::new(
-        HookListener {
-            is_hit: Arc::clone(&is_hit),
-            stats:  Arc::clone(&stats),
-            corpus: Arc::clone(&corpus_fuzz),
-
-            fuzz_input:   Vec::new(),
-            bitmap: Box::new(Bitmap::new()),
-        }
-    ));
-            
-    let interceptor = Box::leak(Box::new(Interceptor::obtain(&GUM)));
-    interceptor.attach(
-        NativePointer(TARGET_ADDR as *mut _),
-        listener,
-    ).unwrap();
-
-    // monitor worker
     let corpus2 = corpus.clone();
     let stats2 = Arc::clone(&stats);
     std::thread::spawn(move|| {
-        worker_monitor(corpus2, stats2);
-    });
+        let listener = TcpListener::bind("0.0.0.0:1212").expect("Failed create server");
+        println!("[+] Listening on port 1212");
+        println!("[+] Waiting hit for target...");
 
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let corpus3 = corpus2.clone();
+                    let stats3 = Arc::clone(&stats2);
+
+                    std::thread::spawn(move|| {
+                        handle_client(stream, corpus3, stats3);
+                    });
+                }
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+    });
 }
